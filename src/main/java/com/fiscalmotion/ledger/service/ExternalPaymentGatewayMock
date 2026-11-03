@@ -1,0 +1,30 @@
+package com.fiscalmotion.ledger.service;
+
+import io.github.resilience4j.circuitbreaker.annotation.CircuitBreaker;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Service;
+
+import java.util.Random;
+
+@Service
+public class ExternalPaymentGatewayMock {
+
+    private static final Logger log = LoggerFactory.getLogger(ExternalPaymentGatewayMock.class);
+    private final Random random = new Random();
+
+    @CircuitBreaker(name = "externalPaymentGateway", fallbackMethod = "gatewayFallback")
+    public String verifyExternalAccount(String accountNumber) {
+        // Simulate random downstream failures (30% chance)
+        if (random.nextInt(10) < 3) {
+            log.error("External payment gateway timed out for account: {}", accountNumber);
+            throw new RuntimeException("External Gateway Connection Failed");
+        }
+        return "VERIFIED";
+    }
+
+    public String gatewayFallback(String accountNumber, Throwable t) {
+        log.warn("Circuit Breaker OPEN or active. Executing fallback for account: {}", accountNumber);
+        return "VERIFICATION_DEFERRED";
+    }
+}

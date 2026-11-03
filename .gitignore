@@ -1,0 +1,17 @@
+# Target / Build directories
+/target/
+*.class
+
+# IntelliJ / IDE settings
+.idea/
+*.iml
+*.iws
+*.ipr
+out/
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Docker / Prometheus temporary data
+*.log

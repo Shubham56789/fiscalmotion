@@ -1,0 +1,62 @@
+spring:
+  application:
+    name: fiscalmotion
+  threads:
+    virtual:
+      enabled: true
+  datasource:
+    url: jdbc:postgresql://localhost:5434/ledgerflow
+    username: dbuser
+    password: dbpassword
+    driver-class-name: org.postgresql.Driver
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: true
+    properties:
+      hibernate:
+        format_sql: true
+  data:
+    redis:
+      host: localhost
+      port: 6379
+  kafka:
+    bootstrap-servers: localhost:9092
+
+resilience4j:
+  ratelimiter:
+    metrics:
+      enabled: true
+    instances:
+      ledgerTransferApi:
+        limitForPeriod: 5           # Max 5 requests allowed
+        limitRefreshPeriod: 1s       # Per 1 second window
+        timeoutDuration: 500ms       # Wait up to 500ms for permission before throwing RateLimitExceededException
+  circuitbreaker:
+    metrics:
+      enabled: true
+    instances:
+      externalPaymentGateway:
+        slidingWindowType: COUNT_BASED
+        slidingWindowSize: 10
+        minimumNumberOfCalls: 5
+        failureRateThreshold: 50     # Trip circuit if 50% of requests fail
+        waitDurationInOpenState: 10s # Stay OPEN for 10 seconds before HALF-OPEN
+        permittedNumberOfCallsInHalfOpenState: 3
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics
+    endpoint:
+      prometheus:
+        enabled: true
+      health:
+        show-details: always
+    metrics:
+      tags:
+        application: fiscalmotion-engine
+      distribution:
+        percentiles-histogram:
+          http.server.requests: true
