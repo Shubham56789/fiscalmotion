@@ -15,3 +15,7 @@ Thumbs.db
 
 # Docker / Prometheus temporary data
 *.log
+
+# Environment files containing secrets
+.env
+*.env
