@@ -1,12 +1,12 @@
 package com.fiscalmotion.ledger.dto;
 
+import jakarta.validation.constraints.DecimalMin;
 import jakarta.validation.constraints.NotNull;
-import jakarta.validation.constraints.Positive;
 import java.math.BigDecimal;
 import java.util.UUID;
 
 public record TransferRequest(
-        @NotNull UUID sourceAccountId,
-        @NotNull UUID targetAccountId,
-        @NotNull @Positive BigDecimal amount
+        @NotNull(message = "sourceAccountId is required") UUID sourceAccountId,
+        @NotNull(message = "targetAccountId is required") UUID targetAccountId,
+        @NotNull(message = "amount is required") @DecimalMin(value = "0.01", message = "amount must be greater than 0") BigDecimal amount
 ) {}

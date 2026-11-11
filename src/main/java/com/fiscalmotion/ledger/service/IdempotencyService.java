@@ -4,28 +4,35 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 
 import java.time.Duration;
+import java.util.Optional;
 
 @Service
 public class IdempotencyService {
 
-    private final StringRedisTemplate redisTemplate;
     private static final String IDEMPOTENCY_PREFIX = "idempotency:";
+    private static final String RESPONSE_PREFIX = "idempotency-response:";
+
+    private final StringRedisTemplate redisTemplate;
 
     public IdempotencyService(StringRedisTemplate redisTemplate) {
         this.redisTemplate = redisTemplate;
     }
 
-    /**
-     * Attempts to acquire an idempotency lock for a key with a given TTL.
-     * @return true if key was acquired (first request), false if duplicate/locked.
-     */
     public boolean lockKey(String idempotencyKey, Duration ttl) {
-        String redisKey = IDEMPOTENCY_PREFIX + idempotencyKey;
-        Boolean success = redisTemplate.opsForValue().setIfAbsent(redisKey, "PROCESSING", ttl);
-        return Boolean.TRUE.equals(success);
+        String key = IDEMPOTENCY_PREFIX + idempotencyKey;
+        return Boolean.TRUE.equals(redisTemplate.opsForValue().setIfAbsent(key, "PROCESSING", ttl));
+    }
+
+    public Optional<String> getResponse(String idempotencyKey) {
+        return Optional.ofNullable(redisTemplate.opsForValue().get(RESPONSE_PREFIX + idempotencyKey));
+    }
+
+    public void saveResponse(String idempotencyKey, String payload, Duration ttl) {
+        redisTemplate.opsForValue().set(RESPONSE_PREFIX + idempotencyKey, payload, ttl);
     }
 
     public void releaseKey(String idempotencyKey) {
         redisTemplate.delete(IDEMPOTENCY_PREFIX + idempotencyKey);
+        redisTemplate.delete(RESPONSE_PREFIX + idempotencyKey);
     }
 }

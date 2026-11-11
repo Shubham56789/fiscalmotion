@@ -31,10 +31,16 @@ public class LedgerController {
             @RequestHeader("Idempotency-Key") String idempotencyKey,
             @Valid @RequestBody TransferRequest request) {
 
+        if (idempotencyKey == null || idempotencyKey.isBlank()) {
+            return ResponseEntity.status(HttpStatus.BAD_REQUEST).body("Idempotency-Key header is required");
+        }
+
         boolean acquired = idempotencyService.lockKey(idempotencyKey, Duration.ofMinutes(10));
         if (!acquired) {
-            return ResponseEntity.status(HttpStatus.CONFLICT)
-                    .body("Concurrent or duplicate request detected for Idempotency-Key: " + idempotencyKey);
+            return idempotencyService.getResponse(idempotencyKey)
+                    .map(response -> ResponseEntity.status(HttpStatus.OK).body(response))
+                    .orElse(ResponseEntity.status(HttpStatus.CONFLICT)
+                            .body("Duplicate or concurrent request detected for Idempotency-Key: " + idempotencyKey));
         }
 
         try {
@@ -44,16 +50,23 @@ public class LedgerController {
                     request.targetAccountId(),
                     request.amount()
             );
+
+            String responsePayload = String.format(
+                    "{\"transactionId\":\"%s\",\"referenceId\":\"%s\",\"status\":\"%s\"}",
+                    transaction.getId(),
+                    transaction.getReferenceId(),
+                    transaction.getStatus()
+            );
+
+            idempotencyService.saveResponse(idempotencyKey, responsePayload, Duration.ofMinutes(30));
+
             return ResponseEntity.status(HttpStatus.CREATED).body(transaction);
-        } catch (IllegalStateException e) {
-            return ResponseEntity.status(HttpStatus.CONFLICT).body(e.getMessage());
         } catch (Exception e) {
             idempotencyService.releaseKey(idempotencyKey);
-            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(e.getMessage());
+            throw e;
         }
     }
 
-    // Fallback method triggered when rate limit is exceeded
     public ResponseEntity<String> rateLimitFallback(String idempotencyKey, TransferRequest request, RequestNotPermitted ex) {
         return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
                 .body("Rate limit exceeded. FiscalMotion limits transaction requests to 5 per second.");
