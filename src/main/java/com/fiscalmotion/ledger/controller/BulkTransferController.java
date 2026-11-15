@@ -1,8 +1,10 @@
+
 package com.fiscalmotion.ledger.controller;
 
 import com.fiscalmotion.ledger.dto.BulkTransferRequest;
 import com.fiscalmotion.ledger.dto.BulkTransferResponse;
 import com.fiscalmotion.ledger.service.BulkTransferService;
+import com.fiscalmotion.ledger.service.BulkTransferStatusService;
 
 import jakarta.validation.Valid;
 
@@ -21,9 +23,14 @@ import org.springframework.web.bind.annotation.*;
 public class BulkTransferController {
 
     private final BulkTransferService service;
+    private final BulkTransferStatusService statusService;
 
-    public BulkTransferController(BulkTransferService service) {
+    public BulkTransferController(
+            BulkTransferService service,
+            BulkTransferStatusService statusService
+    ) {
         this.service = service;
+        this.statusService = statusService;
     }
 
     @PostMapping("/bulk")
@@ -42,6 +49,25 @@ public class BulkTransferController {
                 request,
                 authentication.getName()
         );
+
+        return ResponseEntity.ok(response);
+    }
+
+    @GetMapping("/bulk/{batchId}")
+    public ResponseEntity<BulkTransferResponse> getStatus(
+            @PathVariable String batchId,
+            Authentication authentication
+    ) {
+        if (authentication == null
+                || !authentication.isAuthenticated()) {
+            return ResponseEntity.status(401).build();
+        }
+
+        BulkTransferResponse response =
+                statusService.getStatus(
+                        batchId,
+                        authentication.getName()
+                );
 
         return ResponseEntity.ok(response);
     }
