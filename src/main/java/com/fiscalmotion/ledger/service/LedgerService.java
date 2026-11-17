@@ -1,5 +1,8 @@
 package com.fiscalmotion.ledger.service;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fiscalmotion.ledger.dto.TransactionCreatedEvent;
 import com.fiscalmotion.ledger.exception.AccountNotFoundException;
 import com.fiscalmotion.ledger.exception.InsufficientBalanceException;
 import com.fiscalmotion.ledger.exception.InvalidTransferException;
@@ -8,10 +11,14 @@ import com.fiscalmotion.ledger.model.*;
 import com.fiscalmotion.ledger.repository.AccountRepository;
 import com.fiscalmotion.ledger.repository.OutboxEventRepository;
 import com.fiscalmotion.ledger.repository.TransactionRepository;
+import com.fiscalmotion.ledger.validation.JournalWriteValidator;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import com.fiscalmotion.ledger.validation.MoneyValidator;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.math.BigDecimal;
 import java.util.UUID;
@@ -24,22 +31,34 @@ public class LedgerService {
     private final OutboxEventRepository outboxEventRepository;
     private final Counter transactionCounter;
     private final Counter volumeCounter;
+    private final JournalWriteValidator journalWriteValidator;
+    private final ObjectMapper objectMapper;
 
-    public LedgerService(AccountRepository accountRepository,
-                         TransactionRepository transactionRepository,
-                         OutboxEventRepository outboxEventRepository,
-                         MeterRegistry meterRegistry) {
+    public LedgerService(
+            AccountRepository accountRepository,
+            TransactionRepository transactionRepository,
+            OutboxEventRepository outboxEventRepository,
+            JournalWriteValidator journalWriteValidator,
+            MeterRegistry meterRegistry,
+            ObjectMapper objectMapper
+    ) {
         this.accountRepository = accountRepository;
         this.transactionRepository = transactionRepository;
         this.outboxEventRepository = outboxEventRepository;
+        this.journalWriteValidator = journalWriteValidator;
+        this.objectMapper = objectMapper;
 
-        this.transactionCounter = Counter.builder("fiscalmotion.transactions.total")
-                .description("Total successful double-entry transactions")
-                .register(meterRegistry);
+        this.transactionCounter = Counter.builder(
+                "fiscalmotion.transactions.total"
+        ).description(
+                "Total successful double-entry transactions"
+        ).register(meterRegistry);
 
-        this.volumeCounter = Counter.builder("fiscalmotion.transactions.volume.inr")
-                .description("Total amount processed in INR")
-                .register(meterRegistry);
+        this.volumeCounter = Counter.builder(
+                "fiscalmotion.transactions.volume.inr"
+        ).description(
+                "Total amount processed in INR"
+        ).register(meterRegistry);
     }
 
     @Transactional
@@ -53,9 +72,7 @@ public class LedgerService {
         if (sourceAccountId.equals(targetAccountId)) {
             throw new InvalidTransferException("sourceAccountId and targetAccountId cannot be the same");
         }
-        if (amount == null || amount.compareTo(BigDecimal.ZERO) <= 0) {
-            throw new InvalidTransferException("amount must be greater than zero");
-        }
+        amount = MoneyValidator.requirePositive(amount);
 
         transactionRepository.findByReferenceId(referenceId)
                 .ifPresent(tx -> {
@@ -75,6 +92,17 @@ public class LedgerService {
         Account targetAccount = firstAccount.getId().equals(targetAccountId)
                 ? firstAccount : secondAccount;
 
+        if (
+                sourceAccount.getAccountNumber()
+                        .startsWith("FM-SYSTEM-") ||
+                        targetAccount.getAccountNumber()
+                                .startsWith("FM-SYSTEM-")
+        ) {
+            throw new InvalidTransferException(
+                    "System accounts cannot participate in customer transfers"
+            );
+        }
+
         if (!sourceAccount.getCurrency().equalsIgnoreCase(targetAccount.getCurrency())) {
             throw new InvalidTransferException("Accounts must be in the same currency");
         }
@@ -88,29 +116,70 @@ public class LedgerService {
         accountRepository.saveAll(java.util.List.of(sourceAccount, targetAccount));
         accountRepository.flush();
 
-        Transaction transaction = new Transaction(referenceId, TransactionStatus.COMPLETED);
-        transaction.addLedgerEntry(new LedgerEntry(sourceAccount, EntryType.DEBIT, amount));
-        transaction.addLedgerEntry(new LedgerEntry(targetAccount, EntryType.CREDIT, amount));
+        Transaction transaction = new Transaction(
+                referenceId,
+                TransactionStatus.COMPLETED
+        );
 
-        Transaction savedTransaction = transactionRepository.save(transaction);
+        transaction.addLedgerEntry(
+                new LedgerEntry(sourceAccount, EntryType.DEBIT, amount)
+        );
+
+        transaction.addLedgerEntry(
+                new LedgerEntry(targetAccount, EntryType.CREDIT, amount)
+        );
+
+// Mandatory validation before persistence.
+        journalWriteValidator.validate(transaction);
+
+        Transaction savedTransaction =
+                transactionRepository.save(transaction);
+
+
+        TransactionCreatedEvent eventPayload =
+                new TransactionCreatedEvent(
+                        savedTransaction.getId(),
+                        referenceId,
+                        sourceAccountId,
+                        targetAccountId,
+                        amount,
+                        "COMPLETED"
+                );
+
+        final String payload;
+
+        try {
+            payload = objectMapper.writeValueAsString(eventPayload);
+        } catch (JsonProcessingException ex) {
+            throw new IllegalStateException(
+                    "Failed to serialize transaction event",
+                    ex
+            );
+        }
 
         OutboxEvent event = new OutboxEvent(
                 "TRANSACTION",
                 savedTransaction.getId().toString(),
                 "TRANSACTION_CREATED",
-                String.format(
-                        "{\"transactionId\":\"%s\",\"referenceId\":\"%s\",\"sourceAccountId\":\"%s\",\"targetAccountId\":\"%s\",\"amount\":\"%s\",\"status\":\"COMPLETED\"}",
-                        savedTransaction.getId(),
-                        referenceId,
-                        sourceAccountId,
-                        targetAccountId,
-                        amount
-                )
+                payload
         );
+
         outboxEventRepository.save(event);
 
-        transactionCounter.increment();
-        volumeCounter.increment(amount.doubleValue());
+
+        final BigDecimal committedAmount = amount;
+
+        TransactionSynchronizationManager.registerSynchronization(
+                new TransactionSynchronization() {
+                    @Override
+                    public void afterCommit() {
+                        transactionCounter.increment();
+                        volumeCounter.increment(
+                                committedAmount.doubleValue()
+                        );
+                    }
+                }
+        );
 
         return savedTransaction;
     }

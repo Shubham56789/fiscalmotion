@@ -1,47 +1,323 @@
+
 import http from 'k6/http';
-import { check, sleep } from 'k6';
+import { check, sleep, fail } from 'k6';
+import { Counter, Rate, Trend } from 'k6/metrics';
+
+// ========================================
+// FISCALMOTION PERFORMANCE TEST
+// ========================================
+//
+// Modes:
+//   baseline -> 1 virtual user, 60 seconds
+//   load     -> ramp up to 50 virtual users
+//
+// Measures:
+//   - Successful transfer latency
+//   - p50, p90, p95, p99
+//   - Successful transfers
+//   - HTTP 429 rate limiting
+//   - Unexpected errors
+// ========================================
+
+const MODE = __ENV.MODE || 'baseline';
+
+const BASE_URL = (
+    __ENV.FM_BASE_URL || 'http://localhost:8080'
+).replace(/\/$/, '');
+
+const EMAIL = __ENV.FM_EMAIL;
+const PASSWORD = __ENV.FM_PASSWORD;
+
+const SOURCE_ID = __ENV.FM_SOURCE_ID;
+const TARGET_ID = __ENV.FM_TARGET_ID;
+
+const AMOUNT = __ENV.FM_AMOUNT || '1.0000';
+
+// ========================================
+// TEST CONFIGURATION
+// ========================================
 
 export const options = {
-    stages: [
-        { duration: '10s', target: 20 },
-        { duration: '30s', target: 50 },
-        { duration: '10s', target: 0 },
-    ],
+    noCookiesReset: true,
+    scenarios: MODE === 'baseline'
+        ? {
+            baseline: {
+                executor: 'constant-vus',
+                vus: 1,
+                duration: '60s',
+            },
+        }
+        : {
+            load: {
+                executor: 'ramping-vus',
+                startVUs: 0,
+                stages: [
+                    {
+                        duration: '10s',
+                        target: 20,
+                    },
+                    {
+                        duration: '30s',
+                        target: 50,
+                    },
+                    {
+                        duration: '10s',
+                        target: 0,
+                    },
+                ],
+                gracefulRampDown: '10s',
+            },
+        },
+
     thresholds: {
-        http_req_duration: ['p(95)<300', 'p(99)<500'],
-        // Fail only if unexpected error codes (5xx, 400, etc.) exceed 1%
-        'http_req_failed{status:not 429}': ['rate<0.01'],
+        transfer_latency: [
+            'p(95)<300',
+            'p(99)<500',
+        ],
+
+        unexpected_response_rate: [
+            'rate<0.01',
+        ],
     },
 };
 
-// Replace these UUIDs with actual account UUIDs from your PostgreSQL database
-const SOURCE_ACCOUNT_ID = 'd2e27e45-e132-4206-bd19-6d61e0270a88';
-const TARGET_ACCOUNT_ID = '4a61388b-6f2b-4fc5-b95f-d7278c43d7e9';
+// ========================================
+// CUSTOM METRICS
+// ========================================
 
-export default function () {
-    const url = 'http://localhost:8080/api/v1/ledger/transfers';
+const transferLatency = new Trend(
+    'transfer_latency',
+    true
+);
 
-    // Generate unique Idempotency Key per VU and iteration
-    const idempotencyKey = `K6-BENCH-${__VU}-${__ITER}-${Date.now()}`;
+const successfulTransfers = new Counter(
+    'successful_transfers'
+);
+
+const rateLimitedTransfers = new Counter(
+    'rate_limited_transfers'
+);
+
+const unexpectedResponses = new Counter(
+    'unexpected_transfer_responses'
+);
+
+const unexpectedResponseRate = new Rate(
+    'unexpected_response_rate'
+);
+
+// ========================================
+// PER-VIRTUAL-USER SESSION
+// ========================================
+
+let loggedIn = false;
+
+let csrfHeader = 'X-XSRF-TOKEN';
+let csrfToken = '';
+
+// ========================================
+// FETCH CSRF TOKEN
+// ========================================
+
+function refreshCsrf() {
+
+    const response = http.get(
+        `${BASE_URL}/api/v1/auth/csrf`,
+        {
+            tags: {
+                operation: 'csrf',
+            },
+        }
+    );
+
+    if (response.status !== 200) {
+        fail(
+            `CSRF failed: HTTP ${response.status} - ${response.body}`
+        );
+    }
+
+    let body;
+
+    try {
+        body = response.json();
+    } catch (e) {
+        fail(
+            `Invalid CSRF response: ${response.body}`
+        );
+    }
+
+    csrfHeader = body.headerName || 'X-XSRF-TOKEN';
+    csrfToken = body.token;
+
+    if (!csrfToken) {
+        fail('CSRF token missing');
+    }
+}
+
+// ========================================
+// LOGIN
+// ========================================
+
+function login() {
+
+    if (
+        !EMAIL ||
+        !PASSWORD ||
+        !SOURCE_ID ||
+        !TARGET_ID
+    ) {
+        fail(
+            'Missing FM_EMAIL, FM_PASSWORD, ' +
+            'FM_SOURCE_ID or FM_TARGET_ID'
+        );
+    }
+
+    refreshCsrf();
 
     const payload = JSON.stringify({
-        sourceAccountId: SOURCE_ACCOUNT_ID,
-        targetAccountId: TARGET_ACCOUNT_ID,
-        amount: 100.00,
+        email: EMAIL,
+        password: PASSWORD,
     });
 
-    const params = {
-        headers: {
-            'Content-Type': 'application/json',
-            'Idempotency-Key': idempotencyKey,
-        },
-    };
+    const response = http.post(
+        `${BASE_URL}/api/v1/auth/login`,
+        payload,
+        {
+            headers: {
+                'Content-Type': 'application/json',
+                [csrfHeader]: csrfToken,
+            },
 
-    const res = http.post(url, payload, params);
+            tags: {
+                operation: 'login',
+            },
+        }
+    );
 
-    check(res, {
-        'status is 201 or 429': (r) => r.status === 201 || r.status === 429,
+    if (response.status !== 200) {
+
+        fail(
+            `Login failed: HTTP ${response.status} - ${response.body}`
+        );
+    }
+
+    // Login rotates the session ID.
+    // Obtain the current CSRF token afterward.
+    refreshCsrf();
+
+    loggedIn = true;
+}
+
+// ========================================
+// MAIN TRANSFER TEST
+// ========================================
+
+export default function () {
+
+    // Login once per virtual user.
+    if (!loggedIn) {
+        login();
+    }
+
+    // Unique key for every transfer request.
+    const idempotencyKey =
+        `K6-${MODE}-${__VU}-${__ITER}-${Date.now()}`;
+
+    const payload = JSON.stringify({
+
+        sourceAccountId: SOURCE_ID,
+
+        targetAccountId: TARGET_ID,
+
+        amount: Number(AMOUNT),
     });
 
-    sleep(0.1); // Small think-time delay between requests
+    const response = http.post(
+        `${BASE_URL}/api/v1/ledger/transfers`,
+        payload,
+        {
+            headers: {
+
+                'Content-Type': 'application/json',
+
+                'Idempotency-Key': idempotencyKey,
+
+                [csrfHeader]: csrfToken,
+            },
+
+            tags: {
+                operation: 'transfer',
+            },
+
+            responseType: 'text',
+        }
+    );
+
+    // ====================================
+    // SUCCESSFUL TRANSFER
+    // ====================================
+
+    if (response.status === 201) {
+
+        successfulTransfers.add(1);
+
+        transferLatency.add(
+            response.timings.duration
+        );
+
+        unexpectedResponseRate.add(false);
+
+    }
+
+        // ====================================
+        // RATE LIMITED
+    // ====================================
+
+    else if (response.status === 429) {
+
+        rateLimitedTransfers.add(1);
+
+        unexpectedResponseRate.add(false);
+
+    }
+
+        // ====================================
+        // UNEXPECTED RESPONSE
+    // ====================================
+
+    else {
+
+        unexpectedResponses.add(1);
+        unexpectedResponseRate.add(true);
+
+        if (response.status === 401) {
+
+            console.error(
+                `HTTP 401 for ${idempotencyKey}. ` +
+                `Session may have expired or become invalid.`
+            );
+
+            // Login again on the next iteration.
+            loggedIn = false;
+
+        } else {
+
+            console.error(
+                `Unexpected HTTP ${response.status} ` +
+                `for ${idempotencyKey}: ` +
+                `${String(response.body).slice(0, 350)}`
+            );
+        }
+    }
+
+    check(response, {
+
+        'transfer returned 201 or 429': (r) =>
+            r.status === 201 || r.status === 429,
+    });
+
+    // Think time between requests.
+    sleep(
+        MODE === 'baseline' ? 0.4 : 0.1
+    );
 }
